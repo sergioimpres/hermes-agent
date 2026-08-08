@@ -36,6 +36,7 @@ class MediaDescriptor:
     capability can expose opaque handles without widening this DTO.
     """
 
+    attachment_ref: str
     kind: str
     mime_type: str = ""
     file_name: str = ""
@@ -56,7 +57,7 @@ class DurableIngress:
     sender_name: str
     message_type: str
     text: str
-    occurred_at: Optional[float] = None
+    occurred_at: float
     media: tuple[MediaDescriptor, ...] = ()
 
 

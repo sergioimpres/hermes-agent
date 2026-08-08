@@ -4536,19 +4536,26 @@ class TurnRunner:
         _plat_streaming = ctx.resolve_display_setting(
             ctx.user_config, platform_key, "streaming"
         )
+        _stream_adapter = self._runner._adapter_for_source(ctx.source)
+        _delivery_gate_active = bool(
+            _stream_adapter
+            and getattr(_stream_adapter, "automatic_delivery_gate_enabled", False)
+        )
         # None = no per-platform override → follow global config
         _streaming_enabled = (
             _scfg.enabled and _scfg.transport != "off"
             if _plat_streaming is None
             else bool(_plat_streaming)
-        )
+        ) and not _delivery_gate_active
         _want_stream_deltas = _streaming_enabled
-        _want_interim_messages = ctx.interim_assistant_messages_enabled
+        _want_interim_messages = (
+            ctx.interim_assistant_messages_enabled and not _delivery_gate_active
+        )
         _want_interim_consumer = _want_interim_messages
         if _want_stream_deltas or _want_interim_consumer:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
-                _adapter = self._runner._adapter_for_source(ctx.source)
+                _adapter = _stream_adapter
                 if _adapter:
                     _consumer_cfg, _pause_typing_before_finalize = (
                         self._runner._build_stream_consumer_config(
@@ -6272,6 +6279,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Event hook system
         from gateway.hooks import HookRegistry
         self.hooks = HookRegistry()
+        # Started after plugin discovery and before any platform connects.
+        # This runtime exposes typed DTOs only; adapters receive bound callbacks,
+        # never the runtime, runner, journal, config, or credentials.
+        self._gateway_services = None
 
         # Per-chat voice reply mode: "off" | "voice_only" | "all"
         self._voice_mode: Dict[str, str] = self._load_voice_modes()
@@ -11098,6 +11109,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "plugin discovery failed at gateway startup", exc_info=True,
             )
 
+        from hermes_cli.plugins import get_gateway_service_registrations
+
+        _gateway_service_registrations = get_gateway_service_registrations()
+        if _gateway_service_registrations:
+            from gateway.service_runtime import GatewayServiceRuntime
+
+            _service_runtime = GatewayServiceRuntime(
+                _gateway_service_registrations,
+                get_hermes_home() / "gateway" / "service-events.sqlite3",
+            )
+            try:
+                await _service_runtime.start()
+            except Exception:
+                await _service_runtime.stop()
+                logger.error(
+                    "critical gateway service failed during startup",
+                    exc_info=True,
+                )
+                raise
+            self._gateway_services = _service_runtime
+            logger.info(
+                "Started %d gateway plugin service(s)",
+                len(_gateway_service_registrations),
+            )
+
         # Register the generic relay adapter when a connector relay URL is
         # configured (GATEWAY_RELAY_URL / gateway.relay_url). No URL -> no-op, so
         # direct/single-tenant deployments are unaffected. When configured, the
@@ -11277,6 +11313,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # secondary profile: authorization and prompt rendering both run
             # before the narrower agent-turn scope is installed.
             adapter.set_message_handler(self._primary_message_handler())
+            self._wire_gateway_service_handlers(adapter)
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -12660,6 +12697,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
 
                     adapter.set_message_handler(self._primary_message_handler())
+                    self._wire_gateway_service_handlers(adapter)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -13205,6 +13243,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _phase_elapsed(),
             )
 
+            _gateway_services = getattr(self, "_gateway_services", None)
+            if _gateway_services is not None:
+                try:
+                    await _gateway_services.stop()
+                finally:
+                    self._gateway_services = None
+                logger.info(
+                    "Shutdown phase: gateway plugin services stopped at +%.2fs",
+                    _phase_elapsed(),
+                )
+
             for _task in list(self._background_tasks):
                 if _task is self._stop_task:
                     continue
@@ -13619,6 +13668,113 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self._safe_adapter_disconnect(adapter, platform)
         return connected
 
+    def _wire_gateway_service_handlers(self, adapter: BasePlatformAdapter) -> None:
+        """Give an adapter narrow callbacks instead of private runner access."""
+
+        setter = getattr(adapter, "set_gateway_service_handlers", None)
+        if not callable(setter):
+            return
+        runtime = getattr(self, "_gateway_services", None)
+        if runtime is None or not runtime.active:
+            setter(pre_automatic_delivery=None, delivery_state=None)
+            return
+        setter(
+            pre_automatic_delivery=self._pre_automatic_delivery,
+            delivery_state=self._publish_delivery_state,
+        )
+
+    async def _pre_automatic_delivery(self, delivery) -> bool:
+        runtime = getattr(self, "_gateway_services", None)
+        if runtime is None or not runtime.active:
+            return True
+        try:
+            return await runtime.pre_automatic_delivery(delivery)
+        except Exception:
+            logger.error("pre_automatic_delivery failed closed", exc_info=True)
+            return False
+
+    async def _publish_delivery_state(self, event) -> None:
+        runtime = getattr(self, "_gateway_services", None)
+        if runtime is None or not runtime.active:
+            return
+        from gateway.service_api import GatewayEventKind
+
+        await runtime.publish(
+            event.event_id,
+            GatewayEventKind.DELIVERY_STATE,
+            event,
+        )
+
+    async def _publish_durable_ingress(
+        self,
+        *,
+        event: MessageEvent,
+        source,
+        session_entry,
+        session_key: str,
+        text: str,
+    ) -> None:
+        """Durably append and synchronously ACK ingress before any LLM call."""
+
+        runtime = getattr(self, "_gateway_services", None)
+        if runtime is None or not runtime.active:
+            return
+
+        from gateway.service_api import (
+            DurableIngress,
+            GatewayEventKind,
+            MediaDescriptor,
+            stable_ingress_event_id,
+        )
+
+        raw_timestamp = getattr(event, "timestamp", None)
+        if hasattr(raw_timestamp, "timestamp"):
+            try:
+                occurred_at = float(raw_timestamp.timestamp())
+            except Exception:
+                occurred_at = None
+        else:
+            try:
+                occurred_at = float(raw_timestamp) if raw_timestamp is not None else None
+            except (TypeError, ValueError):
+                occurred_at = None
+
+        platform = str(getattr(source.platform, "value", source.platform) or "")
+        platform_message_id = str(getattr(event, "message_id", "") or "")
+        media_types = tuple(getattr(event, "media_types", ()) or ())
+        message_type = str(
+            getattr(getattr(event, "message_type", None), "value", None)
+            or getattr(event, "message_type", "")
+            or ""
+        )
+        media = tuple(
+            MediaDescriptor(kind=message_type, mime_type=str(mime or ""))
+            for mime in media_types
+        )
+        event_id = stable_ingress_event_id(
+            platform=platform,
+            platform_message_id=platform_message_id,
+            session_key=session_key,
+            text=text,
+            occurred_at=occurred_at,
+        )
+        payload = DurableIngress(
+            event_id=event_id,
+            platform=platform,
+            platform_message_id=platform_message_id,
+            session_id=str(getattr(session_entry, "session_id", "") or ""),
+            session_key=session_key,
+            chat_id=str(getattr(source, "chat_id", "") or ""),
+            chat_type=str(getattr(source, "chat_type", "") or ""),
+            sender_id=str(getattr(source, "user_id", "") or ""),
+            sender_name=str(getattr(source, "user_name", "") or ""),
+            message_type=message_type,
+            text=text,
+            occurred_at=occurred_at,
+            media=media,
+        )
+        await runtime.publish(event_id, GatewayEventKind.DURABLE_INGRESS, payload)
+
     def _configure_profile_adapter(
         self,
         adapter: BasePlatformAdapter,
@@ -13627,6 +13783,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
+        self._wire_gateway_service_handlers(adapter)
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
         )
@@ -17961,6 +18118,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         try:
+            # The service runtime appends this event to its FULL-sync outbox
+            # before invoking plugins.  A registered critical service must ACK
+            # the cursor; otherwise the exception stops this turn before the
+            # agent hook and before ``_run_agent`` can make an LLM request.
+            await self._publish_durable_ingress(
+                event=event,
+                source=source,
+                session_entry=session_entry,
+                session_key=session_key,
+                text=(
+                    persist_user_message
+                    if isinstance(persist_user_message, str)
+                    else str(message_text or "")
+                ),
+            )
+
             # Emit agent:start hook
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
@@ -24561,18 +24734,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _plat_streaming = resolve_display_setting(
             user_config, platform_key, "streaming"
         )
+        _stream_adapter = self._adapter_for_source(source)
+        _delivery_gate_active = bool(
+            _stream_adapter
+            and getattr(_stream_adapter, "automatic_delivery_gate_enabled", False)
+        )
         _streaming_enabled = (
             _scfg.enabled and _scfg.transport != "off"
             if _plat_streaming is None
             else bool(_plat_streaming)
-        )
+        ) and not _delivery_gate_active
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
         if _streaming_enabled:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
-                _adapter = self._adapter_for_source(source)
+                _adapter = _stream_adapter
                 if _adapter:
                     _consumer_cfg, _pause_typing_before_finalize = (
                         self._build_stream_consumer_config(

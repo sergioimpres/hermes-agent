@@ -2772,6 +2772,10 @@ class BasePlatformAdapter(ABC):
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
+        # Capability-limited callbacks owned by the gateway service runtime.
+        # Adapters never receive the runner or the service instances.
+        self._pre_automatic_delivery_handler = None
+        self._delivery_state_handler = None
         # Optional gateway-supplied fan-out for platform-native emoji
         # reaction events (see ``set_reaction_handler``).
         self._reaction_handler: Optional[
@@ -3328,6 +3332,52 @@ class BasePlatformAdapter(ABC):
         an optional response string.
         """
         self._message_handler = handler
+
+    def set_gateway_service_handlers(
+        self,
+        *,
+        pre_automatic_delivery=None,
+        delivery_state=None,
+    ) -> None:
+        """Install safe service-boundary callbacks supplied by the runner."""
+
+        self._pre_automatic_delivery_handler = pre_automatic_delivery
+        self._delivery_state_handler = delivery_state
+
+    @property
+    def automatic_delivery_gate_enabled(self) -> bool:
+        return callable(getattr(self, "_pre_automatic_delivery_handler", None))
+
+    async def _pre_automatic_delivery(self, delivery) -> bool:
+        callback = getattr(self, "_pre_automatic_delivery_handler", None)
+        if not callable(callback):
+            return True
+        try:
+            return (await callback(delivery)) is True
+        except Exception:
+            logger.error(
+                "[%s] automatic delivery gate failed closed",
+                self.name,
+                exc_info=True,
+            )
+            return False
+
+    async def _emit_delivery_state(self, event) -> bool:
+        """Publish a durable delivery transition; return False on failure."""
+
+        callback = getattr(self, "_delivery_state_handler", None)
+        if not callable(callback):
+            return True
+        try:
+            await callback(event)
+            return True
+        except Exception:
+            logger.error(
+                "[%s] delivery-state publication failed closed",
+                self.name,
+                exc_info=True,
+            )
+            return False
 
     def set_topic_recovery_fn(
         self,
@@ -5899,11 +5949,19 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        delivery_results = []
+        automatic_delivery_id = None
+        automatic_delivery_allowed = False
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
             if result is None:
                 return
+            if isinstance(result, (list, tuple)):
+                for item in result:
+                    _record_delivery(item)
+                return
+            delivery_results.append(result)
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
@@ -5979,6 +6037,69 @@ class BasePlatformAdapter(ABC):
                 response = None
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
+            if response:
+                from gateway.service_api import (
+                    AutomaticDelivery,
+                    DeliveryState,
+                    DeliveryStateEvent,
+                    delivery_state_event_id,
+                    stable_delivery_id,
+                )
+
+                automatic_delivery_id = stable_delivery_id(
+                    platform=_platform_name(event.source.platform),
+                    session_key=session_key,
+                    inbound_message_id=str(getattr(event, "message_id", "") or ""),
+                    text=str(response),
+                )
+                automatic_delivery = AutomaticDelivery(
+                    delivery_id=automatic_delivery_id,
+                    platform=_platform_name(event.source.platform),
+                    session_key=session_key,
+                    chat_id=str(event.source.chat_id or ""),
+                    reply_to_message_id=str(_reply_anchor_for_event(event) or ""),
+                    text=str(response),
+                )
+                queued = DeliveryStateEvent(
+                    event_id=delivery_state_event_id(
+                        automatic_delivery_id, DeliveryState.QUEUED
+                    ),
+                    delivery_id=automatic_delivery_id,
+                    state=DeliveryState.QUEUED,
+                    platform=automatic_delivery.platform,
+                    chat_id=automatic_delivery.chat_id,
+                )
+                queue_recorded = await self._emit_delivery_state(queued)
+                allowed = queue_recorded and await self._pre_automatic_delivery(
+                    automatic_delivery
+                )
+                if not allowed:
+                    logger.error(
+                        "[%s] automatic delivery %s blocked by gateway service boundary",
+                        self.name,
+                        automatic_delivery_id,
+                    )
+                    failed = DeliveryStateEvent(
+                        event_id=delivery_state_event_id(
+                            automatic_delivery_id, DeliveryState.FAILED
+                        ),
+                        delivery_id=automatic_delivery_id,
+                        state=DeliveryState.FAILED,
+                        platform=automatic_delivery.platform,
+                        chat_id=automatic_delivery.chat_id,
+                        error_code="service_boundary_blocked",
+                    )
+                    await self._emit_delivery_state(failed)
+                    _record_delivery(
+                        SendResult(
+                            success=False,
+                            error="automatic delivery blocked by service boundary",
+                        )
+                    )
+                    response = None
+                else:
+                    automatic_delivery_allowed = True
+
             if response:
                 # Capture [[as_document]] before extract_media strips it, so the
                 # dispatch partition below can route image-extension files
@@ -6132,6 +6253,7 @@ class BasePlatformAdapter(ABC):
                             caption=telegram_tts_caption,
                             metadata=_final_thread_metadata,
                         )
+                        _record_delivery(tts_result)
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
@@ -6251,13 +6373,21 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
+                        batch_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(
+                            batch_result
+                            if batch_result is not None
+                            else SendResult(success=True)
+                        )
                     except Exception as batch_err:
+                        _record_delivery(
+                            SendResult(success=False, error=str(batch_err))
+                        )
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
 
@@ -6293,13 +6423,21 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        batch_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(
+                            batch_result
+                            if batch_result is not None
+                            else SendResult(success=True)
+                        )
                     except Exception as batch_err:
+                        _record_delivery(
+                            SendResult(success=False, error=str(batch_err))
+                        )
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
                 if _non_image_media:
@@ -6346,7 +6484,11 @@ class BasePlatformAdapter(ABC):
                                 is_voice=is_voice,
                                 metadata=_final_thread_metadata,
                             )
+                        _record_delivery(media_result)
                     except Exception as media_err:
+                        _record_delivery(
+                            SendResult(success=False, error=str(media_err))
+                        )
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
                 # Send auto-detected local non-image files as native attachments
@@ -6379,7 +6521,11 @@ class BasePlatformAdapter(ABC):
                                 file_path,
                                 metadata=_final_thread_metadata,
                             )
+                        _record_delivery(file_result)
                     except Exception as file_err:
+                        _record_delivery(
+                            SendResult(success=False, error=str(file_err))
+                        )
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 
                 # A3 (#29346): if a non-empty response produced nothing
@@ -6395,6 +6541,37 @@ class BasePlatformAdapter(ABC):
                         "for %s (empty after extract, recovery yielded nothing).",
                         self.name, len(_response_pre_extract), event.source.chat_id,
                     )
+
+            if automatic_delivery_id and automatic_delivery_allowed:
+                from gateway.service_api import (
+                    DeliveryState,
+                    DeliveryStateEvent,
+                    delivery_state_event_id,
+                )
+
+                final_state = (
+                    DeliveryState.SENT if delivery_succeeded else DeliveryState.FAILED
+                )
+                platform_message_ids: list[str] = []
+                for result in delivery_results:
+                    for message_id in (
+                        *tuple(getattr(result, "continuation_message_ids", ()) or ()),
+                        getattr(result, "message_id", None),
+                    ):
+                        if message_id and str(message_id) not in platform_message_ids:
+                            platform_message_ids.append(str(message_id))
+                final_event = DeliveryStateEvent(
+                    event_id=delivery_state_event_id(
+                        automatic_delivery_id, final_state
+                    ),
+                    delivery_id=automatic_delivery_id,
+                    state=final_state,
+                    platform=_platform_name(event.source.platform),
+                    chat_id=str(event.source.chat_id or ""),
+                    platform_message_ids=tuple(platform_message_ids),
+                    error_code="" if delivery_succeeded else "platform_send_failed",
+                )
+                await self._emit_delivery_state(final_event)
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)

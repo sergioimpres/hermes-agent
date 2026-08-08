@@ -15,10 +15,12 @@ from gateway.platforms.base import (
 from gateway.service_api import (
     AutomaticDelivery,
     DurableIngress,
+    GatewayEvent,
     GatewayEventKind,
     GatewayServiceContext,
     GatewayServiceError,
     GatewayServiceRegistration,
+    MediaDescriptor,
     stable_ingress_event_id,
 )
 from gateway.service_runtime import GatewayServiceRuntime
@@ -61,7 +63,47 @@ def _ingress(event_id="ingress_one"):
         sender_name="Customer",
         message_type="text",
         text="hello",
+        occurred_at=1786158000.0,
     )
+
+
+def test_durable_ingress_wire_dto_preserves_timestamp_and_opaque_attachment_refs():
+    payload = DurableIngress(
+        event_id="ingress_media",
+        platform="whatsapp",
+        platform_message_id="wamid.media",
+        session_id="session-1",
+        session_key="agent:main:whatsapp:dm:customer",
+        chat_id="customer",
+        chat_type="dm",
+        sender_id="customer",
+        sender_name="Customer",
+        message_type="voice",
+        text="",
+        occurred_at=1786158000.0,
+        media=(
+            MediaDescriptor(
+                attachment_ref="ingress_media:attachment:1",
+                kind="voice",
+                mime_type="audio/ogg",
+            ),
+        ),
+    )
+
+    event = GatewayEvent(7, GatewayEventKind.DURABLE_INGRESS, payload)
+    wire = event.to_wire_dict()["payload"]
+
+    assert wire["occurred_at"] == 1786158000.0
+    assert wire["media"] == [
+        {
+            "attachment_ref": "ingress_media:attachment:1",
+            "kind": "voice",
+            "mime_type": "audio/ogg",
+            "file_name": "",
+            "size_bytes": None,
+            "sha256": "",
+        }
+    ]
 
 
 @pytest.mark.asyncio

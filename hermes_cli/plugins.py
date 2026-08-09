@@ -353,6 +353,7 @@ class LoadedPlugin:
     hooks_registered: List[str] = field(default_factory=list)
     middleware_registered: List[str] = field(default_factory=list)
     commands_registered: List[str] = field(default_factory=list)
+    gateway_services_registered: List[str] = field(default_factory=list)
     enabled: bool = False
     error: Optional[str] = None
     # True for a bundled platform plugin recorded as a deferred (not-yet-
@@ -1228,6 +1229,41 @@ class PluginContext:
         self._manager._hooks.setdefault(hook_name, []).append(callback)
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
 
+    def register_gateway_service(
+        self,
+        name: str,
+        factory: Callable,
+        *,
+        critical: bool = False,
+    ) -> None:
+        """Register a long-lived, capability-limited gateway service.
+
+        ``factory`` is called at gateway startup.  The resulting object receives
+        only :class:`gateway.service_api.GatewayServiceContext`; runner,
+        adapter, configuration, database, and credential objects are never
+        injected.  Service names are process-global and must be unique.
+        """
+
+        from gateway.service_api import GatewayServiceRegistration
+
+        normalized = str(name or "").strip()
+        if not normalized:
+            raise ValueError("gateway service name must not be empty")
+        if normalized in self._manager._gateway_services:
+            raise ValueError(f"gateway service {normalized!r} is already registered")
+        if not callable(factory):
+            raise TypeError("gateway service factory must be callable")
+        self._manager._gateway_services[normalized] = GatewayServiceRegistration(
+            name=normalized,
+            factory=factory,
+            critical=bool(critical),
+        )
+        logger.debug(
+            "Plugin %s registered gateway service: %s",
+            self.manifest.name,
+            normalized,
+        )
+
     # -- middleware registration -------------------------------------------
 
     def register_middleware(self, kind: str, callback: Callable) -> None:
@@ -1326,6 +1362,7 @@ class PluginManager:
         # Plugin-registered auxiliary tasks: key → {key, display_name,
         # description, defaults, plugin}. See PluginContext.register_auxiliary_task.
         self._aux_tasks: Dict[str, Dict[str, Any]] = {}
+        self._gateway_services: Dict[str, Any] = {}
         # Slack Block Kit action handlers registered by plugins. Each entry
         # is (matcher, callback, plugin_name); the Slack adapter wires them
         # into its slack_bolt App at connect() time. ``matcher`` is whatever
@@ -1362,6 +1399,7 @@ class PluginManager:
             self._plugin_skills.clear()
             self._portable_mcp_servers.clear()
             self._aux_tasks.clear()
+            self._gateway_services.clear()
             self._slack_action_handlers.clear()
             self._context_engine = None
         # Set the flag up front as a re-entrancy guard (a plugin's register()
@@ -1948,6 +1986,7 @@ class PluginManager:
                 _mw_counts_before = {
                     kind: len(cbs) for kind, cbs in self._middleware.items()
                 }
+                _gateway_services_before = set(self._gateway_services)
                 register_fn(ctx)
                 loaded.tools_registered = [
                     t for t in self._plugin_tool_names
@@ -1966,6 +2005,11 @@ class PluginManager:
                 loaded.commands_registered = [
                     c for c in self._plugin_commands
                     if self._plugin_commands[c].get("plugin") == manifest.name
+                ]
+                loaded.gateway_services_registered = [
+                    name
+                    for name in self._gateway_services
+                    if name not in _gateway_services_before
                 ]
                 loaded.enabled = True
                 logger.debug(
@@ -2141,6 +2185,11 @@ class PluginManager:
         """Return True when at least one callback is registered for a hook."""
         return bool(self._hooks.get(hook_name))
 
+    def gateway_service_registrations(self) -> tuple[Any, ...]:
+        """Return immutable registration records for gateway startup."""
+
+        return tuple(self._gateway_services.values())
+
     def has_middleware(self, kind: str) -> bool:
         """Return True when at least one callback is registered for middleware."""
         return bool(self._middleware.get(kind))
@@ -2304,6 +2353,12 @@ def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from middleware callbacks.
     """
     return get_plugin_manager().invoke_middleware(kind, **kwargs)
+
+
+def get_gateway_service_registrations() -> tuple[Any, ...]:
+    """Return gateway-service registrations from loaded plugins."""
+
+    return get_plugin_manager().gateway_service_registrations()
 
 
 def has_middleware(kind: str) -> bool:
